@@ -688,8 +688,9 @@ int Socket_new(const char* addr, size_t addr_len, int port, int* sock)
 
 	FUNC_ENTRY;
 	*sock = -1;
+#if defined(AF_INET6)
 	memset(&address6, '\0', sizeof(address6));
-
+#endif
 	if (addr[0] == '[')
 	{
 		++addr;
@@ -1057,7 +1058,11 @@ char* Socket_getaddrname(struct sockaddr* sa, int sock)
  */
 char* Socket_getpeer(int sock)
 {
+#if defined(AF_INET6)
 	struct sockaddr_in6 sa;
+#else
+	struct sockaddr_in sa;
+#endif
 	socklen_t sal = sizeof(sa);
 
 	if (getpeername(sock, (struct sockaddr*)&sa, &sal) == SOCKET_ERROR)
