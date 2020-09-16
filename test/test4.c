@@ -26,6 +26,7 @@
 #include "MQTTAsync.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #if !defined(_WINDOWS)
 	#include <sys/time.h>
