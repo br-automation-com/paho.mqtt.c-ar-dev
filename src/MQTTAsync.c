@@ -286,15 +286,25 @@ int MQTTAsync_init(void)
 	/* #warning "no pthread_mutexattr_settype" */
 #endif
 	if ((rc = pthread_mutex_init(mqttasync_mutex, &attr)) != 0)
+	{	
 		printf("MQTTAsync: error %d initializing async_mutex\n", rc);
+	}
 	else if ((rc = pthread_mutex_init(mqttcommand_mutex, &attr)) != 0)
+	{
 		printf("MQTTAsync: error %d initializing command_mutex\n", rc);
+	}
 	else if ((rc = pthread_mutex_init(socket_mutex, &attr)) != 0)
+	{
 		printf("MQTTClient: error %d initializing socket_mutex\n", rc);
+	}
 	else if ((rc = pthread_cond_init(&send_cond->cond, NULL)) != 0)
+	{
 		printf("MQTTAsync: error %d initializing send_cond cond\n", rc);
+	}
 	else if ((rc = pthread_mutex_init(&send_cond->mutex, &attr)) != 0)
+	{
 		printf("MQTTAsync: error %d initializing send_cond mutex\n", rc);
+	}
 
 	return rc;
 }
