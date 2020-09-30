@@ -562,7 +562,7 @@ thread_return_type cond_secondary(void* n)
 int cond_test()
 {
 	int rc = 0;
-	cond_type cond = Thread_create_cond();
+	cond_type cond = Thread_create_cond(&rc);
 	thread_type thread;
 
 	printf("Post secondary so it should return immediately\n");
@@ -594,7 +594,7 @@ thread_return_type sem_secondary(void* n)
 	printf("Secondary semaphore pointer %p\n", sem);
 
 	rc = Thread_check_sem(sem);
-	assert("rc 1 from check_sem", rc == 1, "rc was %d", rc);
+	assert("rc 1 from check_sem", rc == 1, "rc was %d\n", rc);
 
 	printf("Secondary thread about to wait\n");
 	rc = Thread_wait_sem(sem, 99999);
@@ -613,7 +613,7 @@ thread_return_type sem_secondary(void* n)
 int sem_test()
 {
 	int rc = 0;
-	sem_type sem = Thread_create_sem();
+	sem_type sem = Thread_create_sem(&rc);
 	thread_type thread;
 
 	printf("Primary semaphore pointer %p\n", sem);
@@ -621,23 +621,23 @@ int sem_test()
 	rc = Thread_check_sem(sem);
 	assert("rc 0 from check_sem", rc == 0, "rc was %d\n", rc);
 
-	printf("post secondary so then check should be 1\n");
+	printf("post primary so then check should be 1\n");
 	rc = Thread_post_sem(sem);
 	assert("rc 0 from post_sem", rc == 0, "rc was %d\n", rc);
 
 	rc = Thread_check_sem(sem);
-	assert("rc 1 from check_sem", rc == 1, "rc was %d", rc);
+	assert("rc 1 from check_sem", rc == 1, "rc was %d\n", rc);
 
 	printf("Starting secondary thread\n");
 	thread = Thread_start(sem_secondary, (void*)sem);
 
 	sleep(3);
 	rc = Thread_check_sem(sem);
-	assert("rc 1 from check_sem", rc == 1, "rc was %d", rc);
+	assert("rc 1 from check_sem", rc == 1, "rc was %d\n", rc);
 
 	printf("post secondary\n");
 	rc = Thread_post_sem(sem);
-	assert("rc 1 from post_sem", rc == 1, "rc was %d", rc);
+	assert("rc 1 from post_sem", rc == 1, "rc was %d\n", rc);
 
 	sleep(3);
 
@@ -650,7 +650,7 @@ int sem_test()
 int main(int argc, char *argv[])
 {
 	sem_test();
-	//cond_test();
+	cond_test();
 }
 
 #endif
