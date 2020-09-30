@@ -281,7 +281,7 @@ int MQTTAsync_init(void)
 
 	pthread_mutexattr_init(&attr);
 #if !defined(_WRS_KERNEL)
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+//	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
 #else
 	/* #warning "no pthread_mutexattr_settype" */
 #endif
