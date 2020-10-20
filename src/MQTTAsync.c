@@ -241,17 +241,13 @@ BOOL APIENTRY DllMain(HANDLE hModule,
 	switch (ul_reason_for_call)
 	{
 		case DLL_PROCESS_ATTACH:
-			Log(TRACE_MAX, -1, "DLL process attach");
 			MQTTAsync_init();
 			break;
 		case DLL_THREAD_ATTACH:
-			Log(TRACE_MAX, -1, "DLL thread attach");
 			break;
 		case DLL_THREAD_DETACH:
-			Log(TRACE_MAX, -1, "DLL thread detach");
 			break;
 		case DLL_PROCESS_DETACH:
-			Log(TRACE_MAX, -1, "DLL process detach");
 			if (lpReserved)
 				MQTTAsync_cleanup();
 		break;
@@ -385,6 +381,9 @@ typedef struct MQTTAsync_struct
 	MQTTAsync_disconnected* disconnected;
 	void* disconnected_context; /* the context to be associated with the disconnected callback*/
 
+	MQTTAsync_updateConnectOptions* updateConnectOptions;
+	void* updateConnectOptions_context;
+
 	/* Each time connect is called, we store the options that were used.  These are reused in
 	   any call to reconnect, or an automatic reconnect attempt */
 	MQTTAsync_command connect;		/* Connect operation properties */
@@ -427,6 +426,8 @@ typedef struct
 	MQTTAsync_command command;
 	MQTTAsyncs* client;
 	unsigned int seqno; /* only used on restore */
+	int not_restored;
+	char* key; /* if not_restored, this holds the key */
 } MQTTAsync_queuedCommand;
 
 
@@ -438,7 +439,7 @@ static void MQTTAsync_terminate(void);
 #if !defined(NO_PERSISTENCE)
 static int MQTTAsync_unpersistCommand(MQTTAsync_queuedCommand* qcmd);
 static int MQTTAsync_persistCommand(MQTTAsync_queuedCommand* qcmd);
-static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int buflen, int MQTTVersion);
+static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int buflen, int MQTTVersion, MQTTAsync_queuedCommand*);
 /*static void MQTTAsync_insertInOrder(List* list, void* content, int size);*/
 static int MQTTAsync_restoreCommands(MQTTAsyncs* client);
 #endif
@@ -593,6 +594,12 @@ int MQTTAsync_createWithOptions(MQTTAsync* handle, const char* serverURI, const 
 	if (!UTF8_validateString(clientId))
 	{
 		rc = MQTTASYNC_BAD_UTF8_STRING;
+		goto exit;
+	}
+
+	if (strlen(clientId) == 0 && persistence_type == MQTTCLIENT_PERSISTENCE_DEFAULT)
+	{
+		rc = MQTTASYNC_PERSISTENCE_ERROR;
 		goto exit;
 	}
 
@@ -932,6 +939,9 @@ static int MQTTAsync_persistCommand(MQTTAsync_queuedCommand* qcmd)
 
 	if (nbufs > 0)
 	{
+		if (aclient->c->beforeWrite)
+			rc = aclient->c->beforeWrite(aclient->c->beforeWrite_context, nbufs, (char**)bufs, lens);
+
 		if ((rc = aclient->c->persistence->pput(aclient->c->phandle, key, nbufs, (char**)bufs, lens)) != 0)
 			Log(LOG_ERROR, 0, "Error persisting command, rc %d", rc);
 		qcmd->seqno = aclient->command_seqno;
@@ -948,18 +958,24 @@ exit:
 }
 
 
-static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int buflen, int MQTTVersion)
+static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int buflen, int MQTTVersion, MQTTAsync_queuedCommand* qcommand)
 {
 	MQTTAsync_command* command = NULL;
-	MQTTAsync_queuedCommand* qcommand = NULL;
 	char* ptr = buffer;
 	int i;
 	size_t data_size;
 
 	FUNC_ENTRY;
-	if ((qcommand = malloc(sizeof(MQTTAsync_queuedCommand))) == NULL)
-		goto exit;
-	memset(qcommand, '\0', sizeof(MQTTAsync_queuedCommand));
+	if (qcommand == NULL)
+	{
+		if ((qcommand = malloc(sizeof(MQTTAsync_queuedCommand))) == NULL)
+			goto exit;
+		memset(qcommand, '\0', sizeof(MQTTAsync_queuedCommand));
+		qcommand->not_restored = 1; /* don't restore all the command on the first call */
+	}
+	else
+		qcommand->not_restored = 0;
+
 	command = &qcommand->command;
 
 	command->type = *(int*)ptr;
@@ -971,6 +987,8 @@ static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int bufle
 	switch (command->type)
 	{
 		case SUBSCRIBE:
+			if (qcommand->not_restored == 0)
+				break;
 			command->details.sub.count = *(int*)ptr;
 			ptr += sizeof(int);
 
@@ -1038,6 +1056,8 @@ static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int bufle
 			break;
 
 		case UNSUBSCRIBE:
+			if (qcommand->not_restored == 0)
+				break;
 			command->details.unsub.count = *(int*)ptr;
 			ptr += sizeof(int);
 
@@ -1069,26 +1089,32 @@ static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int bufle
 
 		case PUBLISH:
 			data_size = strlen(ptr) + 1;
-			if ((command->details.pub.destinationName = malloc(data_size)) == NULL)
+			if (qcommand->not_restored == 0)
 			{
-				free(qcommand);
-				qcommand = NULL;
-				goto exit;
+				if ((command->details.pub.destinationName = malloc(data_size)) == NULL)
+				{
+					free(qcommand);
+					qcommand = NULL;
+					goto exit;
+				}
+				strcpy(command->details.pub.destinationName, ptr);
 			}
-			strcpy(command->details.pub.destinationName, ptr);
 			ptr += data_size;
 
 			command->details.pub.payloadlen = *(int*)ptr;
 			ptr += sizeof(int);
 
 			data_size = command->details.pub.payloadlen;
-			if ((command->details.pub.payload = malloc(data_size)) == NULL)
+			if (qcommand->not_restored == 0)
 			{
-				free(qcommand);
-				qcommand = NULL;
-				goto exit;
+				if ((command->details.pub.payload = malloc(data_size)) == NULL)
+				{
+					free(qcommand);
+					qcommand = NULL;
+					goto exit;
+				}
+				memcpy(command->details.pub.payload, ptr, data_size);
 			}
-			memcpy(command->details.pub.payload, ptr, data_size);
 			ptr += data_size;
 
 			command->details.pub.qos = *(int*)ptr;
@@ -1103,7 +1129,7 @@ static MQTTAsync_queuedCommand* MQTTAsync_restoreCommand(char* buffer, int bufle
 			qcommand = NULL;
 
 	}
-	if (qcommand != NULL && MQTTVersion >= MQTTVERSION_5 &&
+	if (qcommand != NULL && qcommand->not_restored == 0 && MQTTVersion >= MQTTVERSION_5 &&
 			MQTTProperties_read(&command->properties, &ptr, buffer + buflen) != 1)
 	{
 			Log(LOG_ERROR, -1, "Error restoring properties from persistence");
@@ -1115,6 +1141,10 @@ exit:
 	return qcommand;
 }
 
+struct keyloc {
+	int seqno;
+	ListElement* elem;
+};
 
 /**
  * Inserts the specified message into the list, maintaining command sequence no order.
@@ -1122,20 +1152,77 @@ exit:
  * @param content the message to add.
  * @param size size of the message.
  */
-static void MQTTAsync_insertInOrder(List* list, void* content, int size)
+static void MQTTAsync_insertInOrder(List* list, void* content, int size, struct keyloc* keyloc_array, int array_size)
 {
-	ListElement* index = NULL;
-	ListElement* current = NULL;
+	ListElement* insert_point = NULL;
+	ListElement* inserted = NULL;
+	int seqno = ((MQTTAsync_queuedCommand*)content)->seqno;
+	int low = 0;
 
 	FUNC_ENTRY;
-	while (ListNextElement(list, &current) != NULL && index == NULL)
-	{
-		if (((MQTTAsync_queuedCommand*)content)->seqno < ((MQTTAsync_queuedCommand*)current->content)->seqno)
-			index = current;
-	}
+	/*printf("\nseqno %d array_size %d\n", seqno, array_size);
 
-	ListInsert(list, content, size, index);
+	int i;
+	for (i = 0; i < array_size; ++i)
+		printf("%d ", keyloc_array[i].seqno);
+	printf("\n"); */
+
+	/* look through keyloc array to find location to insert message - binary search by sequence number */
+	if (array_size > 0 && seqno > keyloc_array[array_size - 1].seqno)
+	{
+		low = array_size - 1;
+	}
+	else if (array_size > 0)
+	{
+		int high = array_size - 1;
+		int divide_index = array_size / 2;
+
+		//printf("divide index %d\n", divide_index);
+		//int count = 0;
+		while (high - low > 1)
+		{
+			if (seqno < keyloc_array[divide_index].seqno)
+				high = divide_index;
+			else
+				low = divide_index;
+
+			divide_index = (high - low) / 2 + low;
+			/*printf("high %d low %d divide_index %d\n", high, low, divide_index);
+			if (++count == 10)
+				exit(99);*/
+		}
+	}
+	//printf("low %d\n", low);
+
+	insert_point = keyloc_array[low].elem;
+	if (insert_point)
+		insert_point = insert_point->next;
+
+	//if (insert_point)
+	//	printf("insert after %d %d\n", keyloc_array[low].seqno, ((MQTTAsync_queuedCommand*)insert_point->content)->seqno);
+	inserted = ListInsert(list, content, size, insert_point);
+
+	if (array_size > 0 && low + 1 < array_size)
+	{
+		/* make space for new entry in array after low point*/
+		//printf("array_size - low %d\n", array_size - low);
+		memmove(&keyloc_array[low+2], &keyloc_array[low+1], (array_size - low - 1) * sizeof(struct keyloc));
+	}
+	keyloc_array[low+1].seqno = seqno;
+	keyloc_array[low+1].elem = inserted;
+
+	/*if (array_size > 50)
+		exit(99);*/
+
 	FUNC_EXIT;
+}
+
+static int cmpkeys(const void *p1, const void *p2)
+{
+   int key1 = atoi(strchr(*(char * const *)p1, '-') + 1);
+   int key2 = atoi(strchr(*(char * const *)p2, '-') + 1);
+
+   return (key1 == key2) ? 0 : ((key1 < key2) ? -1 : 1);
 }
 
 
@@ -1149,8 +1236,31 @@ static int MQTTAsync_restoreCommands(MQTTAsyncs* client)
 	int commands_restored = 0;
 
 	FUNC_ENTRY;
-	if (c->persistence && (rc = c->persistence->pkeys(c->phandle, &msgkeys, &nkeys)) == 0)
+	if (c->persistence && (rc = c->persistence->pkeys(c->phandle, &msgkeys, &nkeys)) == 0 && nkeys > 0)
 	{
+		MQTTAsync_queuedCommand* sentinel = NULL;
+		/* keep track of location of nkeys key locations for fast insert */
+		struct keyloc* keyloc_array = malloc(sizeof(struct keyloc) * (nkeys + 1));
+
+		/* let's have the sequence number array sorted */
+		qsort(msgkeys, (size_t)nkeys, sizeof(char*), cmpkeys);
+		/*for (i = 0; i < nkeys; ++i) printf("%s ", msgkeys[i]); printf("\n");*/
+		if (keyloc_array == NULL)
+		{
+			rc = PAHO_MEMORY_ERROR;
+			goto exit;
+		}
+		sentinel = malloc(sizeof(MQTTAsync_queuedCommand));
+		if (sentinel == NULL)
+		{
+			free(keyloc_array);
+			rc = PAHO_MEMORY_ERROR;
+			goto exit;
+		}
+		sentinel->seqno = -1;
+		keyloc_array[0].seqno = -1;
+		keyloc_array[0].elem = ListAppend(commands, sentinel, sizeof(MQTTAsync_queuedCommand));
+
 		while (rc == 0 && i < nkeys)
 		{
 			char *buffer = NULL;
@@ -1161,19 +1271,29 @@ static int MQTTAsync_restoreCommands(MQTTAsyncs* client)
 			{
 				;
 			}
-			else if ((rc = c->persistence->pget(c->phandle, msgkeys[i], &buffer, &buflen)) == 0)
+			else
 			{
-				int MQTTVersion =
-					(strncmp(msgkeys[i], PERSISTENCE_V5_COMMAND_KEY, strlen(PERSISTENCE_V5_COMMAND_KEY)) == 0)
-					? MQTTVERSION_5 : MQTTVERSION_3_1_1;
-				MQTTAsync_queuedCommand* cmd = MQTTAsync_restoreCommand(buffer, buflen, MQTTVersion);
+				MQTTAsync_queuedCommand* cmd = NULL;
+				if ((rc = c->persistence->pget(c->phandle, msgkeys[i], &buffer, &buflen)) == 0 &&
+					(c->afterRead == NULL || (rc = c->afterRead(c->afterRead_context, &buffer, &buflen)) == 0))
+				{
+					int MQTTVersion = (strncmp(msgkeys[i], PERSISTENCE_V5_COMMAND_KEY, strlen(PERSISTENCE_V5_COMMAND_KEY)) == 0)
+										? MQTTVERSION_5 : MQTTVERSION_3_1_1;
+					cmd = MQTTAsync_restoreCommand(buffer, buflen, MQTTVersion, NULL);
+					/* As the entire command is not restored on the first read to save memory, we temporarily store
+					 * the filename of the persisted command to be used when restoreCommand is called the second time.
+					 */
+					cmd->key = malloc(strlen(msgkeys[i])+1);
+					strcpy(cmd->key, msgkeys[i]);
+				}
 
 				if (cmd)
 				{
 					cmd->client = client;
 					cmd->seqno = atoi(strchr(msgkeys[i], '-')+1); /* key format is tag'-'seqno */
-					MQTTAsync_insertInOrder(commands, cmd, sizeof(MQTTAsync_queuedCommand));
-					free(buffer);
+					MQTTAsync_insertInOrder(commands, cmd, sizeof(MQTTAsync_queuedCommand), keyloc_array, i + 1);
+					if (buffer)
+						free(buffer);
 					client->command_seqno = max(client->command_seqno, cmd->seqno);
 					commands_restored++;
 					if (cmd->command.type == PUBLISH)
@@ -1186,7 +1306,14 @@ static int MQTTAsync_restoreCommands(MQTTAsyncs* client)
 		}
 		if (msgkeys != NULL)
 			free(msgkeys);
+
+		/*int j; for (j = 0; j < i + 1; ++j) printf("%d ", keyloc_array[j].seqno); printf("\n"); */
+		ListRemoveHead(commands); /* remove sentinel */
+		/*ListElement* pos = NULL; while (ListNextElement(commands, &pos)) printf("%d ", ((MQTTAsync_queuedCommand*)(pos->content))->seqno); printf("\n");*/
+
+		free(keyloc_array);
 	}
+exit:
 	Log(TRACE_MINIMUM, -1, "%d commands restored for client %s", commands_restored, c->clientID);
 	FUNC_EXIT_RC(rc);
 	return rc;
@@ -1320,10 +1447,38 @@ static int MQTTAsync_addCommand(MQTTAsync_queuedCommand* command, int command_si
 		ListAppend(commands, command, command_size);
 #if !defined(NO_PERSISTENCE)
 		if (command->client->c->persistence)
-			MQTTAsync_persistCommand(command);
+		{
+			if (command->command.type == PUBLISH &&
+				command->client->createOptions && command->client->createOptions->struct_version >= 2 &&
+				command->client->createOptions->persistQoS0 == 0 && command->command.details.pub.qos == 0)
+				; /* don't persist QoS0 if that create option is set to 0 */
+			else
+			{
+				int rc = MQTTAsync_persistCommand(command);
+				if (command->command.type == PUBLISH && rc == 0)
+				{
+					char key[PERSISTENCE_MAX_KEY_LENGTH + 1];
+
+					command->not_restored = 1;
+					if (command->client->c->MQTTVersion >= MQTTVERSION_5)
+						sprintf(key, "%s%u", PERSISTENCE_V5_COMMAND_KEY, command->seqno);
+					else
+						sprintf(key, "%s%u", PERSISTENCE_COMMAND_KEY, command->seqno);
+					command->key = malloc(strlen(key+1));
+					strcpy(command->key, key);
+
+					free(command->command.details.pub.payload);
+					command->command.details.pub.payload = NULL;
+					free(command->command.details.pub.destinationName);
+					command->command.details.pub.destinationName = NULL;
+					MQTTProperties_free(&command->command.properties);
+				}
+			}
+		}
 #endif
 		if (command->command.type == PUBLISH)
 		{
+			/* delete oldest message if buffer is full.  We wouldn't be here if delete newest was in operation */
 			if (command->client->createOptions && (command->client->noBufferedMessages >= command->client->createOptions->maxBufferedMessages))
 			{
 				MQTTAsync_queuedCommand* first_publish = NULL;
@@ -1561,6 +1716,8 @@ static void MQTTAsync_freeCommand1(MQTTAsync_queuedCommand *command)
 		command->command.details.pub.payload = NULL;
 	}
 	MQTTProperties_free(&command->command.properties);
+	if (command->not_restored && command->key)
+		free(command->key);
 }
 
 static void MQTTAsync_freeCommand(MQTTAsync_queuedCommand *command)
@@ -1714,8 +1871,7 @@ static int MQTTAsync_processCommand(void)
 			{
 				; /* no more message ids available */
 			}
-			else if (cmd->client->c->MQTTVersion >= MQTTVERSION_5 &&
-				((cmd->command.type == PUBLISH && cmd->command.details.pub.qos > 0) ||
+			else if (((cmd->command.type == PUBLISH && cmd->command.details.pub.qos > 0) ||
 						cmd->command.type == SUBSCRIBE || cmd->command.type == UNSUBSCRIBE) &&
 				(cmd->client->c->outboundMsgs->count >= cmd->client->c->maxInflightMessages))
 			{
@@ -1737,8 +1893,32 @@ static int MQTTAsync_processCommand(void)
 			command->client->noBufferedMessages--;
 		ListDetach(commands, command);
 #if !defined(NO_PERSISTENCE)
+		/*printf("outboundmsgs count %d max inflight %d qos %d %d %d\n", command->client->c->outboundMsgs->count, command->client->c->maxInflightMessages,
+				command->command.details.pub.qos, command->client->c->MQTTVersion, command->command.type);*/
 		if (command->client->c->persistence)
+		{
+			if (command->not_restored)
+			{
+				char* buffer = NULL;
+				int buflen = 0;
+
+				if ((rc = command->client->c->persistence->pget(command->client->c->phandle, command->key, &buffer, &buflen)) == 0
+						&& (command->client->c->afterRead == NULL ||
+					(rc = command->client->c->afterRead(command->client->c->afterRead_context, &buffer, &buflen)) == 0))
+				{
+					int MQTTVersion = (strncmp(command->key, PERSISTENCE_V5_COMMAND_KEY, strlen(PERSISTENCE_V5_COMMAND_KEY)) == 0)
+									? MQTTVERSION_5 : MQTTVERSION_3_1_1;
+					free(command->key);
+					command->key = NULL;
+					command = MQTTAsync_restoreCommand(buffer, buflen, MQTTVersion, command);
+					if (buffer)
+						free(buffer);
+				}
+				else
+					Log(LOG_ERROR, -1, "Error restoring command: rc %d from pget\n", rc);
+			}
 			MQTTAsync_unpersistCommand(command);
+		}
 #endif
 	}
 	MQTTAsync_unlock_mutex(mqttcommand_mutex);
@@ -2055,7 +2235,6 @@ exit:
 static void nextOrClose(MQTTAsyncs* m, int rc, char* message)
 {
 	FUNC_ENTRY;
-
 	if (MQTTAsync_checkConn(&m->connect, m))
 	{
 		MQTTAsync_queuedCommand* conn;
@@ -2159,6 +2338,46 @@ static void MQTTAsync_checkTimeouts(void)
 	  			/* make sure that the version attempts are restarted */
 				if (m->c->MQTTVersion == MQTTVERSION_DEFAULT)
 					conn->command.details.conn.MQTTVersion = 0;
+				if (m->updateConnectOptions)
+				{
+					MQTTAsync_connectData connectData = MQTTAsync_connectData_initializer;
+					int callback_rc = MQTTASYNC_SUCCESS;
+
+					connectData.username = m->c->username;
+					connectData.binarypwd.data = m->c->password;
+					connectData.binarypwd.len = m->c->passwordlen;
+					Log(TRACE_MIN, -1, "Calling updateConnectOptions for client %s", m->c->clientID);
+					callback_rc = (*(m->updateConnectOptions))(m->updateConnectOptions_context, &connectData);
+
+					if (callback_rc == 1)
+					{
+						if (connectData.username != m->c->username)
+						{
+							if (m->c->username)
+								free((void*)m->c->username);
+							if (connectData.username)
+								m->c->username = MQTTStrdup(connectData.username);
+							else
+								m->c->username = NULL;
+						}
+						if (connectData.binarypwd.data != m->c->password)
+						{
+							if (m->c->password)
+								free((void*)m->c->password);
+							if (connectData.binarypwd.data)
+							{
+								m->c->passwordlen = connectData.binarypwd.len;
+								if ((m->c->password = malloc(m->c->passwordlen)))
+									memcpy((void*)m->c->password, connectData.binarypwd.data, m->c->passwordlen);
+							}
+							else
+							{
+								m->c->password = NULL;
+								m->c->passwordlen = 0;
+							}
+						}
+					}
+				}
 				Log(TRACE_MIN, -1, "Automatically attempting to reconnect");
 				MQTTAsync_addCommand(conn, sizeof(m->connect));
 				m->reconnectNow = 0;
@@ -2412,6 +2631,19 @@ void MQTTAsync_free(void* memory)
 }
 
 
+void* MQTTAsync_malloc(size_t size)
+{
+	void* val;
+	int rc = 0;
+
+	FUNC_ENTRY;
+	val = malloc(size);
+	rc = (val != NULL);
+	FUNC_EXIT_RC(rc);
+	return val;
+}
+
+
 static int MQTTAsync_completeConnection(MQTTAsyncs* m, Connack* connack)
 {
 	int rc = MQTTASYNC_FAILURE;
@@ -2502,6 +2734,8 @@ static thread_return_type WINAPI MQTTAsync_receiveThread(void* n)
 		if (rc == SOCKET_ERROR)
 		{
 			Log(TRACE_MINIMUM, -1, "Error from MQTTAsync_cycle() - removing socket %d", sock);
+			if (m->c->connected == 1)
+				MQTTAsync_disconnect_internal(m, 0);
 			nextOrClose(m, rc, "socket error");
 		}
 		else
@@ -2919,7 +3153,6 @@ int MQTTAsync_setDeliveryCompleteCallback(MQTTAsync handle, void* context,
 }
 
 
-
 int MQTTAsync_setDisconnected(MQTTAsync handle, void* context, MQTTAsync_disconnected* disconnected)
 {
 	int rc = MQTTASYNC_SUCCESS;
@@ -2956,6 +3189,72 @@ int MQTTAsync_setConnected(MQTTAsync handle, void* context, MQTTAsync_connected*
 	{
 		m->connected_context = context;
 		m->connected = connected;
+	}
+
+	MQTTAsync_unlock_mutex(mqttasync_mutex);
+	FUNC_EXIT_RC(rc);
+	return rc;
+}
+
+
+int MQTTAsync_setUpdateConnectOptions(MQTTAsync handle, void* context, MQTTAsync_updateConnectOptions* updateOptions)
+{
+	int rc = MQTTASYNC_SUCCESS;
+	MQTTAsyncs* m = handle;
+
+	FUNC_ENTRY;
+	MQTTAsync_lock_mutex(mqttasync_mutex);
+
+	if (m == NULL)
+		rc = MQTTASYNC_FAILURE;
+	else
+	{
+		m->updateConnectOptions_context = context;
+		m->updateConnectOptions = updateOptions;
+	}
+
+	MQTTAsync_unlock_mutex(mqttasync_mutex);
+	FUNC_EXIT_RC(rc);
+	return rc;
+}
+
+
+int MQTTAsync_setBeforePersistenceWrite(MQTTAsync handle, void* context, MQTTPersistence_beforeWrite* co)
+{
+	int rc = MQTTASYNC_SUCCESS;
+	MQTTAsyncs* m = handle;
+
+	FUNC_ENTRY;
+	MQTTAsync_lock_mutex(mqttasync_mutex);
+
+	if (m == NULL)
+		rc = MQTTASYNC_FAILURE;
+	else
+	{
+		m->c->beforeWrite = co;
+		m->c->beforeWrite_context = context;
+	}
+
+	MQTTAsync_unlock_mutex(mqttasync_mutex);
+	FUNC_EXIT_RC(rc);
+	return rc;
+}
+
+
+int MQTTAsync_setAfterPersistenceRead(MQTTAsync handle, void* context, MQTTPersistence_afterRead* co)
+{
+	int rc = MQTTASYNC_SUCCESS;
+	MQTTAsyncs* m = handle;
+
+	FUNC_ENTRY;
+	MQTTAsync_lock_mutex(mqttasync_mutex);
+
+	if (m == NULL)
+		rc = MQTTASYNC_FAILURE;
+	else
+	{
+		m->c->afterRead = co;
+		m->c->afterRead_context = context;
 	}
 
 	MQTTAsync_unlock_mutex(mqttasync_mutex);
@@ -3231,7 +3530,7 @@ int MQTTAsync_connect(MQTTAsync handle, const MQTTAsync_connectOptions* options)
 	}
 	if (options->struct_version != 0 && options->ssl) /* check validity of SSL options structure */
 	{
-		if (strncmp(options->ssl->struct_id, "MQTS", 4) != 0 || options->ssl->struct_version < 0 || options->ssl->struct_version > 4)
+		if (strncmp(options->ssl->struct_id, "MQTS", 4) != 0 || options->ssl->struct_version < 0 || options->ssl->struct_version > 5)
 		{
 			rc = MQTTASYNC_BAD_STRUCTURE;
 			goto exit;
@@ -3425,6 +3724,11 @@ int MQTTAsync_connect(MQTTAsync handle, const MQTTAsync_connectOptions* options)
 			m->c->sslopts->ssl_psk_cb = options->ssl->ssl_psk_cb;
 			m->c->sslopts->ssl_psk_context = options->ssl->ssl_psk_context;
 			m->c->sslopts->disableDefaultTrustStore = options->ssl->disableDefaultTrustStore;
+		}
+		if (m->c->sslopts->struct_version >= 5)
+		{
+			m->c->sslopts->protos = options->ssl->protos;
+			m->c->sslopts->protos_len = options->ssl->protos_len;
 		}
 	}
 #else
@@ -4074,7 +4378,9 @@ static int MQTTAsync_connecting(MQTTAsyncs* m)
 {
 	int rc = -1;
 	char* serverURI = m->serverURI;
+#if defined(OPENSSL)
 	int default_port = MQTT_DEFAULT_PORT;
+#endif
 
 	FUNC_ENTRY;
 	if (m->serverURIcount > 0)
@@ -4087,7 +4393,9 @@ static int MQTTAsync_connecting(MQTTAsyncs* m)
 		else if (strncmp(URI_WS, serverURI, strlen(URI_WS)) == 0)
 		{
 			serverURI += strlen(URI_WS);
+#if defined(OPENSSL)
 			default_port = WS_DEFAULT_PORT;
+#endif
 		}
 #if defined(OPENSSL)
 		else if (strncmp(URI_SSL, serverURI, strlen(URI_SSL)) == 0)
@@ -4568,14 +4876,15 @@ int MQTTAsync_waitForCompletion(MQTTAsync handle, MQTTAsync_token dt, unsigned l
 	}
 
 	elapsed = MQTTTime_elapsed(start);
-	while (elapsed < timeout)
+	while (elapsed < timeout && rc == MQTTASYNC_FAILURE)
 	{
 		MQTTTime_sleep(100);
 		if (MQTTAsync_isComplete(handle, dt) == 1)
-		{
 			rc = MQTTASYNC_SUCCESS; /* well we couldn't find it */
-			goto exit;
-		}
+		MQTTAsync_lock_mutex(mqttasync_mutex);
+		if (m->c->connected == 0)
+			rc = MQTTASYNC_DISCONNECTED;
+		MQTTAsync_unlock_mutex(mqttasync_mutex);
 		elapsed = MQTTTime_elapsed(start);
 	}
 exit:
