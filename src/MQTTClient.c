@@ -258,7 +258,7 @@ int MQTTClient_init(void)
 	int rc;
 
 	pthread_mutexattr_init(&attr);
-#if !defined(_WRS_KERNEL)
+#if !defined(_WRS_KERNEL) && !defined(BR_AUTOMATION_RUNTIME)
 	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
 #else
 	/* #warning "no pthread_mutexattr_settype" */
