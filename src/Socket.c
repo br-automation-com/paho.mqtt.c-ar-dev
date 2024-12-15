@@ -75,8 +75,8 @@ static fd_set wset;
 int Socket_setnonblocking(int sock)
 {
 	int rc;
-#if defined(_WIN32) || defined(_WIN64)
-	u_long flag = 1L;
+#if defined(_WIN32) || defined(_WIN64) || defined(BR_AUTOMATION_RUNTIME)
+	unsigned long flag = 1L;
 
 	FUNC_ENTRY;
 	rc = ioctl(sock, FIONBIO, &flag);
